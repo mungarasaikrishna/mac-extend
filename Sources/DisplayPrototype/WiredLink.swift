@@ -1,0 +1,350 @@
+import CoreVideo
+import CryptoKit
+import Darwin
+import Foundation
+import Network
+
+enum WiredLinkError: LocalizedError {
+    case configuration(String)
+    case timeout(String)
+    case disconnected
+
+    var errorDescription: String? {
+        switch self {
+        case .configuration(let message): return message
+        case .timeout(let operation): return "Timed out while \(operation)."
+        case .disconnected: return "The other Mac disconnected."
+        }
+    }
+}
+
+struct ThunderboltPeer {
+    let local: IPv4Address
+    let peer: IPv4Address?
+    let interface: NWInterface
+
+    init(interfaceName: String, peerAddress: String?) throws {
+        let local = try Self.localAddress(on: interfaceName)
+        let peer: IPv4Address?
+        if let peerAddress {
+            guard let address = IPv4Address(peerAddress), Self.isLinkLocal(address), address != local else {
+                throw WiredLinkError.configuration("Enter the other Mac’s 169.254.x.x Thunderbolt Bridge address.")
+            }
+            peer = address
+        } else {
+            peer = nil
+        }
+        // An IPv4 scope resolves the BSD interface directly. The default network path
+        // may omit a link-local bridge with no default route, especially on Ventura.
+        let interface = try Self.scopedInterface(address: local, name: interfaceName)
+        self.peer = peer
+        self.local = local
+        self.interface = interface
+    }
+
+    fileprivate static func scopedInterface(address: IPv4Address, name: String) throws -> NWInterface {
+        guard let interface = IPv4Address("\(address)%\(name)")?.interface,
+              interface.name == name, interface.index == Int(if_nametoindex(name)) else {
+            throw WiredLinkError.configuration("Could not bind to the selected interface \(name).")
+        }
+        return interface
+    }
+
+    private static func isLinkLocal(_ address: IPv4Address) -> Bool {
+        address.rawValue.prefix(2).elementsEqual([169, 254])
+    }
+
+    static func localAddress(on interfaceName: String) throws -> IPv4Address {
+        guard interfaceName.hasPrefix("bridge") else {
+            throw WiredLinkError.configuration("Choose the Thunderbolt Bridge BSD interface, usually bridge0.")
+        }
+        var list: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&list) == 0, let list else {
+            throw WiredLinkError.configuration("Could not list local network interfaces.")
+        }
+        defer { freeifaddrs(list) }
+        var current: UnsafeMutablePointer<ifaddrs>? = list
+        while let entry = current {
+            let item = entry.pointee
+            current = item.ifa_next
+            guard String(cString: item.ifa_name) == interfaceName,
+                  let address = item.ifa_addr, address.pointee.sa_family == AF_INET else { continue }
+            let bytes = UnsafeRawPointer(address).assumingMemoryBound(to: sockaddr_in.self).pointee.sin_addr
+            if let local = withUnsafeBytes(of: bytes, { IPv4Address(Data($0)) }), isLinkLocal(local) {
+                return local
+            }
+        }
+        throw WiredLinkError.configuration("No 169.254.x.x address on \(interfaceName). Check the cable and Thunderbolt Bridge settings.")
+    }
+
+    func bind(_ parameters: NWParameters, port: NWEndpoint.Port = .any) -> NWParameters {
+        parameters.requiredInterface = interface
+        parameters.requiredLocalEndpoint = .hostPort(host: .ipv4(local), port: port)
+        return parameters
+    }
+
+    func matchesPeer(_ endpoint: NWEndpoint) -> Bool {
+        guard case .hostPort(let host, _) = endpoint else { return false }
+        let address: IPv4Address?
+        switch host {
+        case .ipv4(let ipv4): address = ipv4
+        case .name(let name, _): address = IPv4Address(name)
+        default: address = nil
+        }
+        guard let address, Self.isLinkLocal(address), address.rawValue != local.rawValue else { return false }
+        return peer.map { $0.rawValue == address.rawValue } ?? true
+    }
+
+}
+
+struct WiredLink {
+    static let port = NWEndpoint.Port(rawValue: 49172)!
+    let endpoint: ThunderboltPeer
+    let key: SymmetricKey
+    var local: IPv4Address { endpoint.local }
+    var peerDescription: String { endpoint.peer.map { String(describing: $0) } ?? "MacBook Pro on Thunderbolt" }
+    var interface: NWInterface { endpoint.interface }
+
+    init(interfaceName: String, peerAddress: String?, keyFile: String) throws {
+        endpoint = try ThunderboltPeer(interfaceName: interfaceName, peerAddress: peerAddress)
+        let file = URL(fileURLWithPath: (keyFile as NSString).expandingTildeInPath)
+        let text = try String(contentsOf: file, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let bytes = Data(base64Encoded: text), bytes.count == 32 else {
+            throw WiredLinkError.configuration("The pairing file must contain a 32-byte key generated by --make-key.")
+        }
+        key = SymmetricKey(data: bytes)
+    }
+
+    func parameters(listening: Bool) -> NWParameters {
+        endpoint.bind(pairedTLSParameters(key: key), port: listening ? Self.port : .any)
+    }
+
+    func matchesPeer(_ address: NWEndpoint) -> Bool { endpoint.matchesPeer(address) }
+
+    var discovery: ThunderboltDiscovery {
+        ThunderboltDiscovery(type: "_macextend._tcp", key: key)
+    }
+
+    func makeConnection() throws -> PeerConnection {
+        let remote = try endpoint.remoteEndpoint(port: Self.port, discovery: discovery)
+        return PeerConnection(NWConnection(to: remote, using: parameters(listening: false)))
+    }
+}
+
+
+func waitForVideoPeer(_ link: WiredLink) async throws -> PeerConnection {
+    let accepted = NetworkResult<PeerConnection>()
+    return try await withTaskCancellationHandler {
+        try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                continuation.resume(with: Result {
+                    let listener = try NWListener(using: link.parameters(listening: true))
+                    if link.endpoint.peer == nil { listener.service = link.discovery.service }
+                    defer { listener.cancel() }
+                    listener.stateUpdateHandler = { [weak listener] state in
+                        switch state {
+                        case .ready:
+                            print("Listening on \(link.local):\(listener?.port?.rawValue ?? 0). Start --receive-connect on the iMac.")
+                            fflush(stdout)
+                        case .failed(let error), .waiting(let error):
+                            accepted.complete(.failure(error))
+                        default: break
+                        }
+                    }
+                    listener.newConnectionHandler = { connection in
+                        guard link.matchesPeer(connection.endpoint) else {
+                            connection.cancel()
+                            return
+                        }
+                        let peer = PeerConnection(connection)
+                        DispatchQueue.global(qos: .userInitiated).async {
+                            do {
+                                try peer.start()
+                                if !accepted.complete(.success(peer)) { peer.cancel() }
+                            } catch {
+                                peer.cancel()
+                            }
+                        }
+                    }
+                    listener.start(queue: DispatchQueue(label: "iMacExtendedDisplay.ReverseListener"))
+                    return try accepted.wait(seconds: 45, operation: "waiting for the iMac to connect")
+                })
+            }
+        }
+    } onCancel: {
+        accepted.complete(.failure(CancellationError()))
+    }
+}
+
+final class NetworkResult<Value> {
+    let semaphore = DispatchSemaphore(value: 0)
+    let lock = NSLock()
+    var result: Result<Value, Error>?
+
+    @discardableResult
+    func complete(_ result: Result<Value, Error>) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard self.result == nil else { return false }
+        self.result = result
+        semaphore.signal()
+        return true
+    }
+
+    func wait(seconds: Int?, operation: String) throws -> Value {
+        let timeout = seconds.map { DispatchTime.now() + .seconds($0) } ?? .distantFuture
+        guard semaphore.wait(timeout: timeout) == .success else { throw WiredLinkError.timeout(operation) }
+        lock.lock()
+        defer { lock.unlock() }
+        return try result!.get()
+    }
+}
+
+func awaitNetwork<Value>(_ operation: String, seconds: Int? = nil,
+                                 start: (@escaping (Result<Value, Error>) -> Void) -> Void) throws -> Value {
+    let state = NetworkResult<Value>()
+    start { state.complete($0) }
+    return try state.wait(seconds: seconds, operation: operation)
+}
+
+final class PeerConnection {
+    private let connection: NWConnection
+    private let queue = DispatchQueue(label: "iMacExtendedDisplay.VideoNetwork")
+    private let stateLock = NSLock()
+    private var terminalError: Error?
+
+    init(_ connection: NWConnection) {
+        self.connection = connection
+    }
+
+    deinit { cancel() }
+
+    func start(operation: String = "connecting to the other Mac and completing TLS") throws {
+        do {
+            let _: Void = try awaitNetwork(operation, seconds: 10) { finish in
+                connection.stateUpdateHandler = { [weak self] state in
+                    switch state {
+                    case .ready: finish(.success(()))
+                    case .failed(let error), .waiting(let error):
+                        self?.recordTermination(error)
+                        finish(.failure(error))
+                    case .cancelled:
+                        self?.recordTermination(WiredLinkError.disconnected)
+                        finish(.failure(WiredLinkError.disconnected))
+                    default: break
+                    }
+                }
+                connection.start(queue: queue)
+            }
+        } catch {
+            cancel()
+            throw error
+        }
+    }
+
+    private func recordTermination(_ error: Error) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        if terminalError == nil { terminalError = error }
+    }
+
+    func checkConnected() throws {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        if let terminalError { throw terminalError }
+    }
+
+    func cancel() { connection.cancel() }
+
+    func sendFrame(_ frame: Data) throws {
+        guard (1...VideoWire.maximumFrameBytes).contains(frame.count) else { throw VideoWireError.invalidFrame }
+        var message = VideoWire.integer(frame.count)
+        message.append(frame)
+        try send(message)
+    }
+
+    func send(_ data: Data, operation: String = "sending a video frame") throws {
+        let _: Void = try awaitNetwork(operation, seconds: 5) { finish in
+            connection.send(content: data, completion: .contentProcessed { error in
+                if let error { finish(.failure(error)) } else { finish(.success(())) }
+            })
+        }
+    }
+
+    func receiveFrame() throws -> Data {
+        let header = try receive(exactly: 4)
+        let count = VideoWire.number(header)
+        guard (1...VideoWire.maximumFrameBytes).contains(count) else { throw VideoWireError.invalidFrame }
+        return try receive(exactly: count, seconds: 10)
+    }
+
+    func receive(exactly count: Int, seconds: Int? = nil,
+                 operation: String = "receiving a video frame") throws -> Data {
+        try awaitNetwork(operation, seconds: seconds) { finish in
+            connection.receive(minimumIncompleteLength: count, maximumLength: count) { data, _, _, error in
+                if let error {
+                    finish(.failure(error))
+                } else if let data, data.count == count {
+                    finish(.success(data))
+                } else {
+                    finish(.failure(WiredLinkError.disconnected))
+                }
+            }
+        }
+    }
+}
+
+func checkWiredVideoLoopback(resolution: VideoResolution,
+                             key: SymmetricKey = SymmetricKey(size: .bits256)) throws {
+    // Exercise the same scoped interface lookup and strict interface binding as the wired path.
+    let loopback = try ThunderboltPeer.scopedInterface(address: IPv4Address.loopback, name: "lo0")
+    let parameters = pairedTLSParameters(key: key)
+    parameters.requiredInterface = loopback
+    parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: .any)
+    let listener = try NWListener(using: parameters)
+    defer { listener.cancel() }
+
+    defer {
+        listener.stateUpdateHandler = nil
+        listener.newConnectionHandler = nil
+    }
+    let received = NetworkResult<Data>()
+    listener.newConnectionHandler = { incoming in
+        DispatchQueue.global(qos: .userInitiated).async {
+            let server = PeerConnection(incoming)
+            defer { server.cancel() }
+            received.complete(Result {
+                try server.start()
+                return try server.receiveFrame()
+            })
+        }
+    }
+
+    let port: NWEndpoint.Port = try awaitNetwork("starting the loopback receiver", seconds: 5) { finish in
+        listener.stateUpdateHandler = { state in
+            switch state {
+            case .ready:
+                if let port = listener.port { finish(.success(port)) }
+            case .failed(let error): finish(.failure(error))
+            default: break
+            }
+        }
+        listener.start(queue: DispatchQueue(label: "iMacExtendedDisplay.LoopbackReceiver"))
+    }
+
+    let clientParameters = pairedTLSParameters(key: key)
+    clientParameters.requiredInterface = loopback
+    let client = PeerConnection(NWConnection(host: "127.0.0.1", port: port, using: clientParameters))
+    defer { client.cancel() }
+    try client.start()
+
+    let packed = try VideoWire.pack(makeEncodedTestFrame(resolution: resolution))
+    try client.sendFrame(packed)
+    let bytes = try received.wait(seconds: 5, operation: "waiting for the loopback video sample")
+    guard bytes == packed else { throw VideoWireError.invalidFrame }
+    let decoded = try decodeFrame(VideoWire.unpack(bytes, sequence: 0))
+    let width = CVPixelBufferGetWidth(decoded)
+    let height = CVPixelBufferGetHeight(decoded)
+    guard width == resolution.width, height == resolution.height else { throw VideoWireError.invalidFrame }
+    print("Encrypted video round trip decoded a \(width) × \(height) frame (\(bytes.count) wire bytes).")
+}

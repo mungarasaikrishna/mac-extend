@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 345" role="img" aria-labelledby="title desc">
+  <title id="title">Mac Extend connection and video directions</title>
+  <desc id="desc">Start Sharing on MacBook, then Connect from the iMac. Both authenticate with the same key. Video flows from MacBook to iMac.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="9" markerHeight="8" refX="8" refY="4" orient="auto"><path d="M0 0L9 4L0 8Z" fill="#22658b"/></marker>
+  </defs>
+  <rect width="1000" height="345" rx="22" fill="#f2f7fb"/>
+  <g font-family="system-ui, sans-serif" fill="#14283b">
+    <text x="28" y="43" font-size="24" font-weight="700">Connection direction and video direction</text>
+    <rect x="42" y="70" width="260" height="58" rx="13" fill="#e0eefc"/>
+    <rect x="698" y="70" width="260" height="58" rx="13" fill="#def4ee"/>
+    <text x="172" y="105" text-anchor="middle" font-size="18" font-weight="700">MacBook Pro</text>
+    <text x="828" y="105" text-anchor="middle" font-size="18" font-weight="700">iMac</text>
+    <path d="M172 128V304M828 128V304" stroke="#94aabb" stroke-width="2" stroke-dasharray="5 5"/>
+    <g stroke="#22658b" stroke-width="2.4" marker-end="url(#arrow)">
+      <path d="M821 197H179"/><path d="M179 282H821"/>
+    </g>
+    <g text-anchor="middle">
+      <text x="500" y="170" font-size="17" font-weight="650">iMac connects to MacBook on TCP 49172</text>
+      <text x="500" y="225" font-size="14" fill="#40596d">Both Macs authenticate with the same pairing key</text>
+      <text x="500" y="257" font-size="17" font-weight="650">MacBook sends encrypted H.264 video to iMac</text>
+      <text x="500" y="319" font-size="14" fill="#40596d">One direct Thunderbolt Bridge connection</text>
+    </g>
+  </g>
+</svg>
